@@ -1,5 +1,7 @@
 #![no_std]
 
+mod test;
+
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, contractevent, symbol_short, 
     Address, Env, Symbol, token, Vec,
