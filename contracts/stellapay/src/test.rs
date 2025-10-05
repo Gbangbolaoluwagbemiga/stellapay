@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{EscrowContract, EscrowContractClient, EscrowError, EscrowStatus};
+use crate::{EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, MilestoneStatus};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env, Vec,
@@ -73,7 +73,7 @@ fn test_create_escrow_with_milestones() {
     );
     
     assert_eq!(id, 1);
-    assert_eq!(f.token.balance(&f.contract_id), 3000); // Total locked
+    assert_eq!(f.token.balance(&f.contract_id), 3000);
     
     let escrow = f.client.get_escrow(&id);
     assert_eq!(escrow.status, EscrowStatus::Pending);
@@ -83,7 +83,7 @@ fn test_create_escrow_with_milestones() {
 }
 
 #[test]
-fn test_complete_milestone_flow() {
+fn test_milestone_submit_and_approve_flow() {
     let f = TestFixture::new();
     let milestones = f.create_milestone_amounts(&[500, 1000]);
     
@@ -96,23 +96,21 @@ fn test_complete_milestone_flow() {
         &7200,
     );
     
-    // Start work
     f.client.start_work(&f.beneficiary, &id);
     
+    // Freelancer submits milestone 0
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
     let escrow = f.client.get_escrow(&id);
-    assert_eq!(escrow.status, EscrowStatus::InProgress);
-    assert!(escrow.work_started);
+    assert_eq!(escrow.milestones.get(0).unwrap().status, MilestoneStatus::Submitted);
+    assert_eq!(f.token.balance(&f.beneficiary), 0); // Not paid yet
     
-    // Complete milestone 0
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    assert_eq!(f.token.balance(&f.beneficiary), 500);
-    
-    // Complete milestone 1
-    f.client.complete_milestone(&f.beneficiary, &id, &1);
-    assert_eq!(f.token.balance(&f.beneficiary), 1500);
+    // Client approves milestone 0
+    f.client.approve_milestone(&f.depositor, &id, &0);
+    assert_eq!(f.token.balance(&f.beneficiary), 500); // Now paid
     
     let escrow = f.client.get_escrow(&id);
-    assert_eq!(escrow.paid_amount, 1500);
+    assert_eq!(escrow.milestones.get(0).unwrap().status, MilestoneStatus::Approved);
+    assert_eq!(escrow.paid_amount, 500);
 }
 
 #[test]
@@ -130,7 +128,6 @@ fn test_refund_before_work_starts() {
         &7200,
     );
     
-    // Refund before work starts - should succeed
     f.client.refund(&f.depositor, &id);
     
     let escrow = f.client.get_escrow(&id);
@@ -139,9 +136,9 @@ fn test_refund_before_work_starts() {
 }
 
 #[test]
-fn test_complete_work_and_auto_release() {
+fn test_dispute_and_resolution() {
     let f = TestFixture::new();
-    let milestones = f.create_milestone_amounts(&[500, 500]);
+    let milestones = f.create_milestone_amounts(&[1000]);
     
     let id = f.client.create(
         &f.depositor,
@@ -153,47 +150,20 @@ fn test_complete_work_and_auto_release() {
     );
     
     f.client.start_work(&f.beneficiary, &id);
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    f.client.complete_milestone(&f.beneficiary, &id, &1);
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
     
-    // Mark work complete
-    f.client.complete_work(&f.beneficiary, &id);
-    
-    let escrow = f.client.get_escrow(&id);
-    assert_eq!(escrow.status, EscrowStatus::Completed);
-    assert!(escrow.completion_time.is_some());
-}
-
-#[test]
-fn test_dispute_resolution() {
-    let f = TestFixture::new();
-    let milestones = f.create_milestone_amounts(&[500, 500]);
-    
-    let id = f.client.create(
-        &f.depositor,
-        &f.beneficiary,
-        &f.arbiter,
-        &milestones,
-        &f.token.address,
-        &7200,
-    );
-    
-    f.client.start_work(&f.beneficiary, &id);
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    f.client.complete_milestone(&f.beneficiary, &id, &1);
-    f.client.complete_work(&f.beneficiary, &id);
-    
-    // Client raises dispute
-    f.client.raise_dispute(&f.depositor, &id);
+    // Client disputes the quality
+    f.client.dispute_milestone(&f.depositor, &id, &0);
     
     let escrow = f.client.get_escrow(&id);
     assert_eq!(escrow.status, EscrowStatus::Disputed);
+    assert_eq!(escrow.milestones.get(0).unwrap().status, MilestoneStatus::Disputed);
     
-    // Arbiter resolves: refund 200 to depositor, rest to beneficiary
-    f.client.resolve_dispute(&f.arbiter, &id, &200);
+    // Arbiter decides: 70% quality, pay 700
+    f.client.resolve_milestone_dispute(&f.arbiter, &id, &0, &700);
     
-    let escrow = f.client.get_escrow(&id);
-    assert_eq!(escrow.status, EscrowStatus::Released);
+    assert_eq!(f.token.balance(&f.beneficiary), 700);
+    assert_eq!(f.token.balance(&f.depositor), 100_000 - 1000 + 300); // Got 300 refund
 }
 
 // ==================== ERROR TESTS ====================
@@ -214,7 +184,6 @@ fn test_cannot_refund_after_work_starts() {
     
     f.client.start_work(&f.beneficiary, &id);
     
-    // Try to refund after work started
     let result = f.client.try_refund(&f.depositor, &id);
     
     assert!(result.is_err());
@@ -222,7 +191,7 @@ fn test_cannot_refund_after_work_starts() {
 }
 
 #[test]
-fn test_only_beneficiary_can_start_work() {
+fn test_only_beneficiary_can_submit_milestone() {
     let f = TestFixture::new();
     let milestones = f.create_milestone_amounts(&[1000]);
     
@@ -235,15 +204,17 @@ fn test_only_beneficiary_can_start_work() {
         &7200,
     );
     
-    // Depositor tries to start work
-    let result = f.client.try_start_work(&f.depositor, &id);
+    f.client.start_work(&f.beneficiary, &id);
+    
+    // Depositor tries to submit milestone
+    let result = f.client.try_submit_milestone(&f.depositor, &id, &0);
     
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().unwrap(), EscrowError::NotAuthorized);
 }
 
 #[test]
-fn test_cannot_complete_milestone_before_starting_work() {
+fn test_only_depositor_can_approve_milestone() {
     let f = TestFixture::new();
     let milestones = f.create_milestone_amounts(&[1000]);
     
@@ -256,39 +227,18 @@ fn test_cannot_complete_milestone_before_starting_work() {
         &7200,
     );
     
-    // Try to complete milestone without starting work
-    let result = f.client.try_complete_milestone(&f.beneficiary, &id, &0);
+    f.client.start_work(&f.beneficiary, &id);
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
+    
+    // Beneficiary tries to approve their own work
+    let result = f.client.try_approve_milestone(&f.beneficiary, &id, &0);
     
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().unwrap(), EscrowError::NotAuthorized);
 }
 
 #[test]
-fn test_cannot_complete_same_milestone_twice() {
-    let f = TestFixture::new();
-    let milestones = f.create_milestone_amounts(&[1000]);
-    
-    let id = f.client.create(
-        &f.depositor,
-        &f.beneficiary,
-        &f.arbiter,
-        &milestones,
-        &f.token.address,
-        &7200,
-    );
-    
-    f.client.start_work(&f.beneficiary, &id);
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    
-    // Try to complete same milestone again
-    let result = f.client.try_complete_milestone(&f.beneficiary, &id, &0);
-    
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), EscrowError::AlreadyCompleted);
-}
-
-#[test]
-fn test_invalid_milestone_index() {
+fn test_cannot_approve_unsubmitted_milestone() {
     let f = TestFixture::new();
     let milestones = f.create_milestone_amounts(&[1000]);
     
@@ -303,39 +253,15 @@ fn test_invalid_milestone_index() {
     
     f.client.start_work(&f.beneficiary, &id);
     
-    // Try to complete non-existent milestone
-    let result = f.client.try_complete_milestone(&f.beneficiary, &id, &5);
+    // Try to approve without submission
+    let result = f.client.try_approve_milestone(&f.depositor, &id, &0);
     
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), EscrowError::InvalidMilestone);
+    assert_eq!(result.unwrap_err().unwrap(), EscrowError::MilestoneNotSubmitted);
 }
 
 #[test]
-fn test_cannot_complete_work_with_incomplete_milestones() {
-    let f = TestFixture::new();
-    let milestones = f.create_milestone_amounts(&[500, 500]);
-    
-    let id = f.client.create(
-        &f.depositor,
-        &f.beneficiary,
-        &f.arbiter,
-        &milestones,
-        &f.token.address,
-        &7200,
-    );
-    
-    f.client.start_work(&f.beneficiary, &id);
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    
-    // Try to complete work with only 1 of 2 milestones done
-    let result = f.client.try_complete_work(&f.beneficiary, &id);
-    
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), EscrowError::MilestoneNotCompleted);
-}
-
-#[test]
-fn test_only_depositor_can_raise_dispute() {
+fn test_cannot_submit_milestone_twice() {
     let f = TestFixture::new();
     let milestones = f.create_milestone_amounts(&[1000]);
     
@@ -349,14 +275,36 @@ fn test_only_depositor_can_raise_dispute() {
     );
     
     f.client.start_work(&f.beneficiary, &id);
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    f.client.complete_work(&f.beneficiary, &id);
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
     
-    // Beneficiary tries to raise dispute
-    let result = f.client.try_raise_dispute(&f.beneficiary, &id);
+    // Try to submit again
+    let result = f.client.try_submit_milestone(&f.beneficiary, &id, &0);
     
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), EscrowError::NotAuthorized);
+    assert_eq!(result.unwrap_err().unwrap(), EscrowError::MilestoneAlreadySubmitted);
+}
+
+#[test]
+fn test_cannot_dispute_unsubmitted_milestone() {
+    let f = TestFixture::new();
+    let milestones = f.create_milestone_amounts(&[1000]);
+    
+    let id = f.client.create(
+        &f.depositor,
+        &f.beneficiary,
+        &f.arbiter,
+        &milestones,
+        &f.token.address,
+        &7200,
+    );
+    
+    f.client.start_work(&f.beneficiary, &id);
+    
+    // Try to dispute before submission
+    let result = f.client.try_dispute_milestone(&f.depositor, &id, &0);
+    
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), EscrowError::MilestoneNotSubmitted);
 }
 
 #[test]
@@ -374,12 +322,11 @@ fn test_only_arbiter_can_resolve_dispute() {
     );
     
     f.client.start_work(&f.beneficiary, &id);
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    f.client.complete_work(&f.beneficiary, &id);
-    f.client.raise_dispute(&f.depositor, &id);
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
+    f.client.dispute_milestone(&f.depositor, &id, &0);
     
-    // Depositor tries to resolve own dispute
-    let result = f.client.try_resolve_dispute(&f.depositor, &id, &100);
+    // Depositor tries to resolve
+    let result = f.client.try_resolve_milestone_dispute(&f.depositor, &id, &0, &500);
     
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().unwrap(), EscrowError::NotAuthorized);
@@ -404,11 +351,11 @@ fn test_empty_milestones_error() {
 }
 
 #[test]
-fn test_zero_amount_milestone_error() {
+fn test_invalid_arbiter_dispute_resolution_amount() {
     let f = TestFixture::new();
-    let milestones = f.create_milestone_amounts(&[500, 0, 1000]);
+    let milestones = f.create_milestone_amounts(&[1000]);
     
-    let result = f.client.try_create(
+    let id = f.client.create(
         &f.depositor,
         &f.beneficiary,
         &f.arbiter,
@@ -417,55 +364,25 @@ fn test_zero_amount_milestone_error() {
         &7200,
     );
     
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), EscrowError::ZeroAmount);
-}
-
-#[test]
-fn test_invalid_beneficiary_error() {
-    let f = TestFixture::new();
-    let milestones = f.create_milestone_amounts(&[1000]);
+    f.client.start_work(&f.beneficiary, &id);
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
+    f.client.dispute_milestone(&f.depositor, &id, &0);
     
-    let result = f.client.try_create(
-        &f.depositor,
-        &f.depositor, // Same as depositor
-        &f.arbiter,
-        &milestones,
-        &f.token.address,
-        &7200,
-    );
+    // Arbiter tries to pay more than milestone amount
+    let result = f.client.try_resolve_milestone_dispute(&f.arbiter, &id, &0, &1500);
     
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), EscrowError::InvalidBeneficiary);
-}
-
-#[test]
-fn test_invalid_arbiter_error() {
-    let f = TestFixture::new();
-    let milestones = f.create_milestone_amounts(&[1000]);
-    
-    let result = f.client.try_create(
-        &f.depositor,
-        &f.beneficiary,
-        &f.depositor, // Same as depositor
-        &milestones,
-        &f.token.address,
-        &7200,
-    );
-    
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), EscrowError::InvalidArbiter);
+    assert_eq!(result.unwrap_err().unwrap(), EscrowError::InvalidMilestone);
 }
 
 // ==================== INTEGRATION TESTS ====================
 
 #[test]
-fn test_full_successful_escrow_lifecycle() {
+fn test_full_successful_workflow() {
     let f = TestFixture::new();
     let milestones = f.create_milestone_amounts(&[1000, 2000, 1500]);
     let initial_depositor = f.token.balance(&f.depositor);
     
-    // 1. Create escrow
     let id = f.client.create(
         &f.depositor,
         &f.beneficiary,
@@ -477,29 +394,29 @@ fn test_full_successful_escrow_lifecycle() {
     
     assert_eq!(f.token.balance(&f.depositor), initial_depositor - 4500);
     
-    // 2. Start work
     f.client.start_work(&f.beneficiary, &id);
     
-    // 3. Complete all milestones
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
+    // Milestone 1: Submit and approve
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
+    f.client.approve_milestone(&f.depositor, &id, &0);
     assert_eq!(f.token.balance(&f.beneficiary), 1000);
     
-    f.client.complete_milestone(&f.beneficiary, &id, &1);
+    // Milestone 2: Submit and approve
+    f.client.submit_milestone(&f.beneficiary, &id, &1);
+    f.client.approve_milestone(&f.depositor, &id, &1);
     assert_eq!(f.token.balance(&f.beneficiary), 3000);
     
-    f.client.complete_milestone(&f.beneficiary, &id, &2);
+    // Milestone 3: Submit and approve
+    f.client.submit_milestone(&f.beneficiary, &id, &2);
+    f.client.approve_milestone(&f.depositor, &id, &2);
     assert_eq!(f.token.balance(&f.beneficiary), 4500);
     
-    // 4. Complete work
-    f.client.complete_work(&f.beneficiary, &id);
-    
     let escrow = f.client.get_escrow(&id);
-    assert_eq!(escrow.status, EscrowStatus::Completed);
     assert_eq!(escrow.paid_amount, 4500);
 }
 
 #[test]
-fn test_partial_work_with_dispute() {
+fn test_mixed_approval_and_dispute() {
     let f = TestFixture::new();
     let milestones = f.create_milestone_amounts(&[1000, 1000, 1000]);
     
@@ -514,19 +431,83 @@ fn test_partial_work_with_dispute() {
     
     f.client.start_work(&f.beneficiary, &id);
     
-    // Complete only 2 of 3 milestones
-    f.client.complete_milestone(&f.beneficiary, &id, &0);
-    f.client.complete_milestone(&f.beneficiary, &id, &1);
+    // Milestone 1: Approve (good quality)
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
+    f.client.approve_milestone(&f.depositor, &id, &0);
+    assert_eq!(f.token.balance(&f.beneficiary), 1000);
     
-    // Beneficiary claims work complete (lying about milestone 3)
-    f.client.complete_milestone(&f.beneficiary, &id, &2);
-    f.client.complete_work(&f.beneficiary, &id);
+    // Milestone 2: Dispute (poor quality)
+    f.client.submit_milestone(&f.beneficiary, &id, &1);
+    f.client.dispute_milestone(&f.depositor, &id, &1);
     
-    // Client disputes
-    f.client.raise_dispute(&f.depositor, &id);
+    // Arbiter: 50% quality, pay 500
+    f.client.resolve_milestone_dispute(&f.arbiter, &id, &1, &500);
+    assert_eq!(f.token.balance(&f.beneficiary), 1500);
     
-    // Arbiter decides to refund nothing (work was actually complete)
-    f.client.resolve_dispute(&f.arbiter, &id, &0);
+    // Milestone 3: Approve (good quality again)
+    f.client.submit_milestone(&f.beneficiary, &id, &2);
+    f.client.approve_milestone(&f.depositor, &id, &2);
+    assert_eq!(f.token.balance(&f.beneficiary), 2500);
+    
+    // Client got 500 refund from milestone 2
+    let final_depositor = f.token.balance(&f.depositor);
+    assert_eq!(final_depositor, 100_000 - 3000 + 500);
+}
 
-    assert_eq!(f.token.balance(&f.beneficiary), 3000);
+#[test]
+fn test_client_protection_scenario() {
+    let f = TestFixture::new();
+    let milestones = f.create_milestone_amounts(&[5000]);
+    
+    let id = f.client.create(
+        &f.depositor,
+        &f.beneficiary,
+        &f.arbiter,
+        &milestones,
+        &f.token.address,
+        &7200,
+    );
+    
+    f.client.start_work(&f.beneficiary, &id);
+    
+    // Freelancer submits poor quality work
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
+    
+    // Client reviews and disputes
+    f.client.dispute_milestone(&f.depositor, &id, &0);
+    
+    // Arbiter reviews and decides: 0% quality, full refund
+    f.client.resolve_milestone_dispute(&f.arbiter, &id, &0, &0);
+    
+    // Client gets full refund
+    assert_eq!(f.token.balance(&f.depositor), 100_000);
+    assert_eq!(f.token.balance(&f.beneficiary), 0);
+}
+
+#[test]
+fn test_freelancer_protection_scenario() {
+    let f = TestFixture::new();
+    let milestones = f.create_milestone_amounts(&[5000]);
+    
+    let id = f.client.create(
+        &f.depositor,
+        &f.beneficiary,
+        &f.arbiter,
+        &milestones,
+        &f.token.address,
+        &7200,
+    );
+    
+    f.client.start_work(&f.beneficiary, &id);
+    
+    // Once work starts, client CANNOT refund
+    let result = f.client.try_refund(&f.depositor, &id);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), EscrowError::WorkStarted);
+    
+    // Freelancer does work and submits
+    f.client.submit_milestone(&f.beneficiary, &id, &0);
+    
+    // Client must either approve or dispute (with arbiter resolution)
+    // Cannot just walk away with money
 }

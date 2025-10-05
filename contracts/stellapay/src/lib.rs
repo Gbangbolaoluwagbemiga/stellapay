@@ -1,7 +1,6 @@
 #![no_std]
 
 mod test;
-
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, contractevent, symbol_short, 
     Address, Env, Symbol, token, Vec,
@@ -11,7 +10,7 @@ const MIN_DURATION: u64 = 3600; // 1 hour
 const MAX_DURATION: u64 = 365 * 24 * 3600; // 1 year
 const TTL_BUFFER: u64 = 30 * 24 * 3600; // 30 days
 const COUNTER_TTL_SECS: u32 = 365 * 24 * 3600;
-const DISPUTE_PERIOD: u64 = 7 * 24 * 3600; // 7 days to dispute after completion
+const DISPUTE_PERIOD: u64 = 7 * 24 * 3600; // 7 days for client to approve/dispute
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -31,17 +30,27 @@ pub enum EscrowError {
     MilestoneNotCompleted = 13,
     DisputePeriodActive = 14,
     WorkStarted = 15,
+    MilestoneAlreadySubmitted = 16,
+    MilestoneNotSubmitted = 17,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EscrowStatus {
     Pending,
-    InProgress,      // Work has started, no refunds
-    Completed,       // Work done, in dispute period
+    InProgress,
     Released,
     Refunded,
-    Disputed,        // Arbiter must resolve
+    Disputed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MilestoneStatus {
+    NotStarted,
+    Submitted,     // Freelancer claims it's done
+    Approved,      // Client approved, payment made
+    Disputed,      // Client disputes quality
 }
 
 #[contracttype]
@@ -49,8 +58,9 @@ pub enum EscrowStatus {
 pub struct Milestone {
     pub description: Symbol,
     pub amount: i128,
-    pub completed: bool,
-    pub completed_at: Option<u64>,
+    pub status: MilestoneStatus,
+    pub submitted_at: Option<u64>,
+    pub approved_at: Option<u64>,
 }
 
 #[contracttype]
@@ -58,7 +68,7 @@ pub struct Milestone {
 pub struct EscrowData {
     pub depositor: Address,
     pub beneficiary: Address,
-    pub arbiter: Address,  //  mandatory for disputes
+    pub arbiter: Address,
     pub token: Address,
     pub total_amount: i128,
     pub paid_amount: i128,
@@ -66,7 +76,6 @@ pub struct EscrowData {
     pub status: EscrowStatus,
     pub milestones: Vec<Milestone>,
     pub work_started: bool,
-    pub completion_time: Option<u64>,  // When work was marked complete
 }
 
 #[contractevent]
@@ -80,7 +89,14 @@ pub struct EscrowCreated {
 
 #[contractevent]
 #[derive(Clone)]
-pub struct MilestoneCompleted {
+pub struct MilestoneSubmitted {
+    pub id: u32,
+    pub milestone_index: u32,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct MilestoneApproved {
     pub id: u32,
     pub milestone_index: u32,
     pub amount: i128,
@@ -91,13 +107,6 @@ pub struct MilestoneCompleted {
 pub struct WorkStarted {
     pub id: u32,
     pub started_at: u64,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct WorkCompleted {
-    pub id: u32,
-    pub completed_at: u64,
 }
 
 fn sym_counter() -> Symbol {
@@ -198,7 +207,6 @@ impl EscrowContract {
     ) -> Result<u32, EscrowError> {
         depositor.require_auth();
 
-        // Validations
         if beneficiary == depositor {
             return Err(EscrowError::InvalidBeneficiary);
         }
@@ -212,7 +220,6 @@ impl EscrowContract {
             return Err(EscrowError::InvalidMilestone);
         }
 
-        // Calculate total amount
         let mut total_amount: i128 = 0;
         for amount in milestone_amounts.iter() {
             if amount <= 0 {
@@ -230,14 +237,14 @@ impl EscrowContract {
 
         let id = peek_next_id(&e)?;
 
-        // Build milestones
         let mut milestones = Vec::new(&e);
-        for (i, amount) in milestone_amounts.iter().enumerate() {
+        for amount in milestone_amounts.iter() {
             milestones.push_back(Milestone {
-                description:  symbol_short!("milestone"),
+                description: symbol_short!("milestone"),
                 amount,
-                completed: false,
-                completed_at: None,
+                status: MilestoneStatus::NotStarted,
+                submitted_at: None,
+                approved_at: None,
             });
         }
 
@@ -252,10 +259,8 @@ impl EscrowContract {
             status: EscrowStatus::Pending,
             milestones,
             work_started: false,
-            completion_time: None,
         };
 
-        // Transfer total amount
         let tf_res = safe_transfer(&e, &token, &depositor, &e.current_contract_address(), &total_amount);
         if tf_res.is_err() {
             release_lock(&e);
@@ -277,7 +282,7 @@ impl EscrowContract {
         Ok(id)
     }
 
-    /// Beneficiary marks work as started (prevents refunds)
+    /// Beneficiary marks work as started (blocks refunds)
     pub fn start_work(e: Env, caller: Address, id: u32) -> Result<(), EscrowError> {
         caller.require_auth();
         acquire_lock(&e)?;
@@ -314,8 +319,8 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Beneficiary marks milestone complete, gets paid
-    pub fn complete_milestone(
+    /// Beneficiary submits milestone for review (no payment yet)
+    pub fn submit_milestone(
         e: Env,
         caller: Address,
         id: u32,
@@ -336,26 +341,70 @@ impl EscrowContract {
             return Err(EscrowError::NotAuthorized);
         }
 
-        let idx = milestone_index as usize;
-        if idx >= escrow.milestones.len().try_into().unwrap() {
+        if milestone_index >= escrow.milestones.len() {
             release_lock(&e);
             return Err(EscrowError::InvalidMilestone);
         }
 
-        let mut milestone = escrow.milestones.get(idx.try_into().unwrap()).unwrap();
-        if milestone.completed {
+        let mut milestone = escrow.milestones.get(milestone_index).unwrap();
+        
+        if milestone.status != MilestoneStatus::NotStarted {
             release_lock(&e);
-            return Err(EscrowError::AlreadyCompleted);
+            return Err(EscrowError::MilestoneAlreadySubmitted);
         }
 
-        // Mark completed
         let now = e.ledger().timestamp();
-        milestone.completed = true;
-        milestone.completed_at = Some(now);
-        escrow.milestones.set(idx.try_into().unwrap(), milestone.clone());
+        milestone.status = MilestoneStatus::Submitted;
+        milestone.submitted_at = Some(now);
+        escrow.milestones.set(milestone_index, milestone);
 
-        // Pay milestone amount
+        store_escrow(&e, id, &escrow);
+
+        MilestoneSubmitted {
+            id,
+            milestone_index,
+        }
+        .publish(&e);
+
+        release_lock(&e);
+        Ok(())
+    }
+
+    /// Client approves milestone (triggers payment)
+    pub fn approve_milestone(
+        e: Env,
+        caller: Address,
+        id: u32,
+        milestone_index: u32,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+        acquire_lock(&e)?;
+
+        let mut escrow = load_escrow(&e, id)?;
+
+        if caller != escrow.depositor {
+            release_lock(&e);
+            return Err(EscrowError::NotAuthorized);
+        }
+
+        if milestone_index >= escrow.milestones.len() {
+            release_lock(&e);
+            return Err(EscrowError::InvalidMilestone);
+        }
+
+        let mut milestone = escrow.milestones.get(milestone_index).unwrap();
+        
+        if milestone.status != MilestoneStatus::Submitted {
+            release_lock(&e);
+            return Err(EscrowError::MilestoneNotSubmitted);
+        }
+
+        let now = e.ledger().timestamp();
+        milestone.status = MilestoneStatus::Approved;
+        milestone.approved_at = Some(now);
+        
         let amount = milestone.amount;
+        escrow.milestones.set(milestone_index, milestone);
         escrow.paid_amount += amount;
 
         store_escrow(&e, id, &escrow);
@@ -374,7 +423,7 @@ impl EscrowContract {
             return Err(EscrowError::TransferFailed);
         }
 
-        MilestoneCompleted {
+        MilestoneApproved {
             id,
             milestone_index,
             amount,
@@ -385,37 +434,111 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Beneficiary marks all work complete (starts dispute period)
-    pub fn complete_work(e: Env, caller: Address, id: u32) -> Result<(), EscrowError> {
+    /// Client disputes milestone quality
+    pub fn dispute_milestone(
+        e: Env,
+        caller: Address,
+        id: u32,
+        milestone_index: u32,
+    ) -> Result<(), EscrowError> {
         caller.require_auth();
         acquire_lock(&e)?;
 
         let mut escrow = load_escrow(&e, id)?;
 
-        if caller != escrow.beneficiary {
+        if caller != escrow.depositor {
             release_lock(&e);
             return Err(EscrowError::NotAuthorized);
         }
 
-        // Verify all milestones completed
-        for milestone in escrow.milestones.iter() {
-            if !milestone.completed {
-                release_lock(&e);
-                return Err(EscrowError::MilestoneNotCompleted);
-            }
+        if milestone_index >= escrow.milestones.len() {
+            release_lock(&e);
+            return Err(EscrowError::InvalidMilestone);
         }
 
-        let now = e.ledger().timestamp();
-        escrow.status = EscrowStatus::Completed;
-        escrow.completion_time = Some(now);
+        let mut milestone = escrow.milestones.get(milestone_index).unwrap();
+        
+        if milestone.status != MilestoneStatus::Submitted {
+            release_lock(&e);
+            return Err(EscrowError::MilestoneNotSubmitted);
+        }
+
+        milestone.status = MilestoneStatus::Disputed;
+        escrow.milestones.set(milestone_index, milestone);
+        escrow.status = EscrowStatus::Disputed;
 
         store_escrow(&e, id, &escrow);
 
-        WorkCompleted {
-            id,
-            completed_at: now,
+        release_lock(&e);
+        Ok(())
+    }
+
+    /// Arbiter resolves disputed milestone
+    pub fn resolve_milestone_dispute(
+        e: Env,
+        caller: Address,
+        id: u32,
+        milestone_index: u32,
+        pay_to_beneficiary: i128,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+        acquire_lock(&e)?;
+
+        let mut escrow = load_escrow(&e, id)?;
+
+        if caller != escrow.arbiter {
+            release_lock(&e);
+            return Err(EscrowError::NotAuthorized);
         }
-        .publish(&e);
+
+        if milestone_index >= escrow.milestones.len() {
+            release_lock(&e);
+            return Err(EscrowError::InvalidMilestone);
+        }
+
+        let mut milestone = escrow.milestones.get(milestone_index).unwrap();
+        
+        if milestone.status != MilestoneStatus::Disputed {
+            release_lock(&e);
+            return Err(EscrowError::NotAuthorized);
+        }
+
+        let milestone_amount = milestone.amount;
+
+        if pay_to_beneficiary < 0 || pay_to_beneficiary > milestone_amount {
+            release_lock(&e);
+            return Err(EscrowError::InvalidMilestone);
+        }
+
+        // Pay beneficiary their portion
+        if pay_to_beneficiary > 0 {
+            safe_transfer(
+                &e,
+                &escrow.token,
+                &e.current_contract_address(),
+                &escrow.beneficiary,
+                &pay_to_beneficiary,
+            )?;
+            escrow.paid_amount += pay_to_beneficiary;
+        }
+
+        // Refund depositor the rest
+        let refund = milestone_amount - pay_to_beneficiary;
+        if refund > 0 {
+            safe_transfer(
+                &e,
+                &escrow.token,
+                &e.current_contract_address(),
+                &escrow.depositor,
+                &refund,
+            )?;
+        }
+
+        milestone.status = MilestoneStatus::Approved;
+        escrow.milestones.set(milestone_index, milestone);
+        escrow.status = EscrowStatus::InProgress;
+
+        store_escrow(&e, id, &escrow);
 
         release_lock(&e);
         Ok(())
@@ -428,19 +551,16 @@ impl EscrowContract {
 
         let mut escrow = load_escrow(&e, id)?;
 
-        // Only depositor can refund
         if caller != escrow.depositor {
             release_lock(&e);
             return Err(EscrowError::NotAuthorized);
         }
 
-        // Cannot refund if work started
         if escrow.work_started {
             release_lock(&e);
             return Err(EscrowError::WorkStarted);
         }
 
-        // Can only refund from Pending status
         if escrow.status != EscrowStatus::Pending {
             release_lock(&e);
             return Err(EscrowError::AlreadyCompleted);
@@ -455,7 +575,6 @@ impl EscrowContract {
         escrow.status = EscrowStatus::Refunded;
         store_escrow(&e, id, &escrow);
 
-        // Refund remaining amount
         let refund_amount = escrow.total_amount - escrow.paid_amount;
         let tf_res = safe_transfer(
             &e,
@@ -469,97 +588,6 @@ impl EscrowContract {
             release_lock(&e);
             return Err(EscrowError::TransferFailed);
         }
-
-        release_lock(&e);
-        Ok(())
-    }
-
-    /// Client disputes completed work (arbiter must resolve)
-    pub fn raise_dispute(e: Env, caller: Address, id: u32) -> Result<(), EscrowError> {
-        caller.require_auth();
-        acquire_lock(&e)?;
-
-        let mut escrow = load_escrow(&e, id)?;
-
-        if caller != escrow.depositor {
-            release_lock(&e);
-            return Err(EscrowError::NotAuthorized);
-        }
-
-        if escrow.status != EscrowStatus::Completed {
-            release_lock(&e);
-            return Err(EscrowError::NotAuthorized);
-        }
-
-        // Check dispute period
-        let now = e.ledger().timestamp();
-        let completion = escrow.completion_time.unwrap();
-        if now > completion + DISPUTE_PERIOD {
-            release_lock(&e);
-            return Err(EscrowError::DisputePeriodActive);
-        }
-
-        escrow.status = EscrowStatus::Disputed;
-        store_escrow(&e, id, &escrow);
-
-        release_lock(&e);
-        Ok(())
-    }
-
-    /// Arbiter resolves dispute
-    pub fn resolve_dispute(
-        e: Env,
-        caller: Address,
-        id: u32,
-        refund_to_depositor: i128,
-    ) -> Result<(), EscrowError> {
-        caller.require_auth();
-        acquire_lock(&e)?;
-
-        let mut escrow = load_escrow(&e, id)?;
-
-        if caller != escrow.arbiter {
-            release_lock(&e);
-            return Err(EscrowError::NotAuthorized);
-        }
-
-        if escrow.status != EscrowStatus::Disputed {
-            release_lock(&e);
-            return Err(EscrowError::NotAuthorized);
-        }
-
-        let remaining = escrow.total_amount - escrow.paid_amount;
-
-        if refund_to_depositor < 0 || refund_to_depositor > remaining {
-            release_lock(&e);
-            return Err(EscrowError::InvalidMilestone);
-        }
-
-        // Refund portion to depositor
-        if refund_to_depositor > 0 {
-            safe_transfer(
-                &e,
-                &escrow.token,
-                &e.current_contract_address(),
-                &escrow.depositor,
-                &refund_to_depositor,
-            )?;
-        }
-
-        // Rest to beneficiary
-        let to_beneficiary = remaining - refund_to_depositor;
-        if to_beneficiary > 0 {
-            safe_transfer(
-                &e,
-                &escrow.token,
-                &e.current_contract_address(),
-                &escrow.beneficiary,
-                &to_beneficiary,
-            )?;
-        }
-
-        escrow.status = EscrowStatus::Released;
-        store_escrow(&e, id, &escrow);
 
         release_lock(&e);
         Ok(())
